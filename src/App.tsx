@@ -21,24 +21,48 @@ import {
   X
 } from 'lucide-react';
 import { format, isToday, isPast, parseISO } from 'date-fns';
-import { Task } from './types';
+import { Task, UserSettings, WorkType } from './types';
 import { cn } from './lib/utils';
 import { prioritizeTasks } from './services/gemini';
 
+const DEFAULT_SETTINGS: UserSettings = {
+  defaultReminderMinutes: 60, // 1 hour
+  notificationsEnabled: false,
+};
+
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [view, setView] = useState<'dashboard' | 'focus' | 'add'>('dashboard');
+  const [view, setView] = useState<'dashboard' | 'focus' | 'add' | 'settings'>('dashboard');
   const [loadingPriorities, setLoadingPriorities] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
+  const [showEnergyModal, setShowEnergyModal] = useState(false);
+  const [prioritizationMessage, setPrioritizationMessage] = useState<string | null>(null);
+
+  // ADHD Check: Tie-break for multiple high urgency tasks
+  const needsEnergyCheck = useMemo(() => {
+    const highUrgency = tasks.filter(t => t.status === 'pending' && t.urgency >= 5);
+    return highUrgency.length > 1 && !settings.energyLevel;
+  }, [tasks, settings.energyLevel]);
 
   // Persistence
   useEffect(() => {
-    const saved = localStorage.getItem('focusnow_tasks');
-    if (saved) {
+    const savedTasks = localStorage.getItem('focusnow_tasks');
+    const savedSettings = localStorage.getItem('focusnow_settings');
+    
+    if (savedTasks) {
       try {
-        setTasks(JSON.parse(saved));
+        setTasks(JSON.parse(savedTasks));
       } catch (e) {
         console.error("Failed to load tasks", e);
+      }
+    }
+    
+    if (savedSettings) {
+      try {
+        setSettings(JSON.parse(savedSettings));
+      } catch (e) {
+        console.error("Failed to load settings", e);
       }
     }
   }, []);
@@ -46,6 +70,57 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('focusnow_tasks', JSON.stringify(tasks));
   }, [tasks]);
+
+  useEffect(() => {
+    localStorage.setItem('focusnow_settings', JSON.stringify(settings));
+  }, [settings]);
+
+  // Notification Logic
+  useEffect(() => {
+    if (!settings.notificationsEnabled) return;
+
+    const checkNotifications = () => {
+      const now = new Date();
+      setTasks(prevTasks => {
+        let updated = false;
+        const newTasks = prevTasks.map(task => {
+          if (task.status !== 'pending' || task.reminderSent) return task;
+          
+          const dueDate = parseISO(task.dueDate);
+          const reminderTime = new Date(dueDate.getTime() - task.reminderMinutes * 60000);
+          
+          if (now >= reminderTime && !task.reminderSent) {
+            // Trigger Notification
+            if (Notification.permission === 'granted') {
+              new Notification(`FocusNow: ${task.title}`, {
+                body: `Tarea por vencer en ${task.reminderMinutes >= 1440 ? `${Math.round(task.reminderMinutes/1440)} día(s)` : `${task.reminderMinutes} minuto(s)`}.`,
+                icon: '/favicon.ico'
+              });
+              updated = true;
+              return { ...task, reminderSent: true };
+            }
+          }
+          return task;
+        });
+        
+        return updated ? newTasks : prevTasks;
+      });
+    };
+
+    const interval = setInterval(checkNotifications, 10000); // Check every 10 seconds
+    return () => clearInterval(interval);
+  }, [settings.notificationsEnabled, settings.defaultReminderMinutes]);
+
+  const requestNotificationPermission = async () => {
+    if ('Notification' in window) {
+      const permission = await Notification.requestPermission();
+      if (permission === 'granted') {
+        setSettings(prev => ({ ...prev, notificationsEnabled: true }));
+      }
+    } else {
+      alert("Tu navegador no soporta notificaciones de escritorio.");
+    }
+  };
 
   const sortedTasks = useMemo(() => {
     return [...tasks]
@@ -58,13 +133,14 @@ export default function App() {
     return sortedTasks[0];
   }, [activeTaskId, sortedTasks, tasks]);
 
-  const handleAddTask = (taskData: Omit<Task, 'id' | 'createdAt' | 'status' | 'suggestedOrder'>) => {
+  const handleAddTask = (taskData: Omit<Task, 'id' | 'createdAt' | 'status' | 'suggestedOrder' | 'reminderSent'>) => {
     const newTask: Task = {
       ...taskData,
       id: crypto.randomUUID(),
       createdAt: new Date().toISOString(),
       status: 'pending',
-      suggestedOrder: tasks.length
+      suggestedOrder: tasks.length,
+      reminderSent: false
     };
     setTasks(prev => [...prev, newTask]);
     setView('dashboard');
@@ -82,18 +158,31 @@ export default function App() {
   };
 
   const handlePrioritize = async () => {
+    if (needsEnergyCheck) {
+      setShowEnergyModal(true);
+      return;
+    }
+
     setLoadingPriorities(true);
     const pending = tasks.filter(t => t.status === 'pending');
     if (pending.length > 0) {
-      const orderedIds = await prioritizeTasks(pending);
+      const orderedIds = await prioritizeTasks(pending, settings.energyLevel);
       setTasks(prev => {
-        return prev.map(t => {
+        const sorted = prev.map(t => {
           const index = orderedIds.indexOf(t.id);
           return {
             ...t,
             suggestedOrder: index === -1 ? 999 : index
           };
         });
+        
+        // Find the top task to show the empathy message
+        const topTask = sorted.filter(t => t.status === 'pending').sort((a, b) => a.suggestedOrder - b.suggestedOrder)[0];
+        if (topTask) {
+          setPrioritizationMessage(`He decidido que empezaremos con "${topTask.title}", yo me encargo de recordar las demás después.`);
+        }
+        
+        return sorted;
       });
     }
     setLoadingPriorities(false);
@@ -133,6 +222,12 @@ export default function App() {
         >
           <Plus size={20} />
         </button>
+        <button 
+          onClick={() => setView('settings')}
+          className={cn("p-2 transition-all hover:bg-black/5 rounded", view === 'settings' ? "text-black" : "text-app-muted")}
+        >
+          <Settings size={20} />
+        </button>
       </nav>
 
       <main className="max-w-5xl mx-auto px-10 pt-20 pb-40">
@@ -150,13 +245,24 @@ export default function App() {
                   <h1 className="text-xs font-bold uppercase tracking-[2px] text-app-muted mb-2">Resumen Diario</h1>
                   <p className="text-app-muted text-sm">Organiza tu enfoque hoy.</p>
                 </div>
-                <button 
-                  onClick={handlePrioritize}
-                  disabled={loadingPriorities || sortedTasks.length < 2}
-                  className="px-6 py-3 bg-black text-white rounded-[4px] text-xs font-bold uppercase tracking-wider hover:opacity-90 transition-all flex items-center gap-2 disabled:opacity-10"
-                >
-                  {loadingPriorities ? "Analizando..." : "Optimizar Itinerario"}
-                </button>
+                <div className="flex flex-col items-end gap-3">
+                  <button 
+                    onClick={handlePrioritize}
+                    disabled={loadingPriorities || sortedTasks.length < 1}
+                    className="px-6 py-3 bg-black text-white rounded-[4px] text-xs font-bold uppercase tracking-wider hover:opacity-90 transition-all flex items-center gap-2 disabled:opacity-10"
+                  >
+                    {loadingPriorities ? "Analizando..." : "Optimizar Itinerario"}
+                  </button>
+                  {prioritizationMessage && (
+                    <motion.p 
+                      initial={{ opacity: 0, y: 5 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="text-[11px] text-orange-600 font-medium italic max-w-[250px] text-right"
+                    >
+                      {prioritizationMessage}
+                    </motion.p>
+                  )}
+                </div>
               </div>
 
               <div className="space-y-12">
@@ -243,11 +349,25 @@ export default function App() {
 
                   <div className="grid grid-cols-3 gap-5 mb-[60px]">
                     <MetaItem label="Urgencia" value={activeTask.urgency === 5 ? "Crítica" : activeTask.urgency >= 4 ? "Alta" : activeTask.urgency >= 2 ? "Media" : "Baja"} />
-                    <MetaItem label="Importancia" value={activeTask.importance >= 4 ? "Alta" : activeTask.importance >= 2 ? "Media" : "Baja"} />
+                    <MetaItem label="Tipo" value={activeTask.workType === 'creative' ? "Creativa 🎨" : "Mecánica ⚙️"} />
                     <MetaItem 
-                      label="Tiempo aprox." 
-                      value={activeTask.effort === 'low' ? "< 1 hora" : activeTask.effort === 'medium' ? "1-3 horas" : "> 3 horas"} 
+                      label="Plan Pomodoro" 
+                      value={
+                        activeTask.effort === 'low' ? "25m x 5m" : 
+                        activeTask.effort === 'medium' ? "45m x 10m" : 
+                        "20m x micro-descansos"
+                      } 
                     />
+                  </div>
+
+                  <div className="p-8 bg-black/5 rounded-[4px] border border-app-border mb-10">
+                    <p className="text-sm font-medium leading-relaxed italic opacity-80">
+                      💡 {
+                        activeTask.effort === 'low' ? "Bloques clásicos para ganar inercia rápido." :
+                        activeTask.effort === 'medium' ? "Aprovechemos el estado de hiperenfoque." :
+                        "Micro-sesiones para evitar el aburrimiento. Prepárate para descansos de dopamina saludable."
+                      }
+                    </p>
                   </div>
 
                   <div className="flex gap-4">
@@ -314,9 +434,122 @@ export default function App() {
                   <div className="text-[11px] font-bold uppercase tracking-[2px] text-app-muted mb-2">Creación</div>
                   <h2 className="text-3xl font-medium tracking-tight">Nueva Tarea</h2>
                 </header>
-                <AddTaskForm onSubmit={handleAddTask} onCancel={() => setView('dashboard')} />
+                <AddTaskForm 
+                  onSubmit={handleAddTask} 
+                  onCancel={() => setView('dashboard')} 
+                  defaultReminder={settings.defaultReminderMinutes}
+                />
               </div>
             </motion.section>
+          )}
+          {view === 'settings' && (
+            <motion.section
+              key="settings"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="max-w-xl mx-auto"
+            >
+              <div className="bg-white p-12 rounded-[4px] border border-app-border shadow-sm">
+                <header className="mb-12">
+                  <div className="text-[11px] font-bold uppercase tracking-[2px] text-app-muted mb-2">Preferencias</div>
+                  <h2 className="text-3xl font-medium tracking-tight">Ajustes</h2>
+                </header>
+                
+                <div className="space-y-10">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="font-medium">Notificaciones de Escritorio</h3>
+                      <p className="text-xs text-app-muted mt-1">Recibe recordatorios antes de que venzan tus tareas.</p>
+                    </div>
+                    <button 
+                      onClick={settings.notificationsEnabled ? () => setSettings(s => ({ ...s, notificationsEnabled: false })) : requestNotificationPermission}
+                      className={cn(
+                        "relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none",
+                        settings.notificationsEnabled ? "bg-black" : "bg-app-border"
+                      )}
+                    >
+                      <span className={cn(
+                        "inline-block h-4 w-4 transform rounded-full bg-white transition-transform",
+                        settings.notificationsEnabled ? "translate-x-6" : "translate-x-1"
+                      )} />
+                    </button>
+                  </div>
+
+                  <div className="space-y-4">
+                    <label className="text-[10px] font-bold uppercase tracking-[2px] text-app-muted">Tiempo de Recordatorio Predeterminado</label>
+                    <div className="grid grid-cols-2 gap-3">
+                      {[
+                        { label: '15 minutos', value: 15 },
+                        { label: '1 hora', value: 60 },
+                        { label: '3 horas', value: 180 },
+                        { label: '1 día', value: 1440 },
+                      ].map((option) => (
+                        <button
+                          key={option.value}
+                          onClick={() => setSettings(s => ({ ...s, defaultReminderMinutes: option.value }))}
+                          className={cn(
+                            "py-3 text-[11px] font-bold uppercase tracking-wider rounded border transition-all text-center",
+                            settings.defaultReminderMinutes === option.value 
+                              ? "bg-black text-white border-black" 
+                              : "bg-transparent border-app-border text-app-muted hover:border-black hover:text-black"
+                          )}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="pt-6 border-t border-app-border">
+                    <button 
+                      onClick={() => setView('dashboard')}
+                      className="w-full bg-black text-white py-4 rounded-[4px] text-xs font-bold uppercase tracking-wider hover:opacity-90 transition-all font-sans"
+                    >
+                      Guardar y Volver
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </motion.section>
+          )}
+          {/* Energy Question Modal (Decision Fatigue Buster) */}
+          {showEnergyModal && (
+             <div className="fixed inset-0 z-[60] flex items-center justify-center p-6 bg-app-bg/80 backdrop-blur-sm">
+                <motion.div 
+                  initial={{ scale: 0.9, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  className="bg-white p-12 rounded-[4px] border border-app-border shadow-xl max-w-lg w-full text-center"
+                >
+                  <Star className="mx-auto mb-6 text-orange-500" size={32} />
+                  <h2 className="text-2xl font-medium mb-4">¿Cómo te sientes en este momento?</h2>
+                  <p className="text-app-muted mb-10 leading-relaxed">
+                    He notado que tienes varias tareas urgentes. Para ayudarte a elegir sin agobios, cuéntame sobre tu energía hoy.
+                  </p>
+                  <div className="flex flex-col gap-4">
+                    <button 
+                      onClick={() => {
+                        setSettings(s => ({ ...s, energyLevel: 'creative' }));
+                        setShowEnergyModal(false);
+                        handlePrioritize();
+                      }}
+                      className="w-full py-4 border border-app-border rounded-[4px] font-medium hover:border-black transition-all"
+                    >
+                      🚀 Me siento creativo y con chispa
+                    </button>
+                    <button 
+                      onClick={() => {
+                        setSettings(s => ({ ...s, energyLevel: 'mechanical' }));
+                        setShowEnergyModal(false);
+                        handlePrioritize();
+                      }}
+                      className="w-full py-4 border border-app-border rounded-[4px] font-medium hover:border-black transition-all"
+                    >
+                      ⚙️ Prefiero algo mecánico y repetitivo
+                    </button>
+                  </div>
+                </motion.div>
+             </div>
           )}
         </AnimatePresence>
       </main>
@@ -376,13 +609,15 @@ function TaskCard({ task, index, onComplete, onDelete, onFocus }: TaskCardProps)
   );
 }
 
-function AddTaskForm({ onSubmit, onCancel }: { onSubmit: (data: any) => void; onCancel: () => void }) {
+function AddTaskForm({ onSubmit, onCancel, defaultReminder }: { onSubmit: (data: any) => void; onCancel: () => void; defaultReminder: number }) {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [dueDate, setDueDate] = useState(new Date().toISOString().split('T')[0]);
   const [urgency, setUrgency] = useState(3);
   const [importance, setImportance] = useState(3);
   const [effort, setEffort] = useState<Task['effort']>('medium');
+  const [workType, setWorkType] = useState<WorkType>('creative');
+  const [reminderMinutes, setReminderMinutes] = useState(defaultReminder);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -393,12 +628,15 @@ function AddTaskForm({ onSubmit, onCancel }: { onSubmit: (data: any) => void; on
       dueDate,
       urgency,
       importance,
-      effort
+      effort,
+      workType,
+      reminderMinutes
     });
   };
 
   return (
     <form onSubmit={handleSubmit} className="space-y-8">
+      {/* ... (keep input title/desc) */}
       <div className="space-y-2">
         <label className="text-[10px] font-bold uppercase tracking-[2px] text-app-muted">¿Qué quieres lograr?</label>
         <input 
@@ -432,9 +670,36 @@ function AddTaskForm({ onSubmit, onCancel }: { onSubmit: (data: any) => void; on
           />
         </div>
         <div className="space-y-3">
-          <label className="text-[10px] font-bold uppercase tracking-[2px] text-app-muted">
-            Nivel de Esfuerzo
-          </label>
+          <label className="text-[10px] font-bold uppercase tracking-[2px] text-app-muted">Naturaleza de la tarea</label>
+          <div className="flex gap-2">
+            <button 
+              type="button" onClick={() => setWorkType('creative')}
+              className={cn("flex-1 py-2 text-[10px] font-bold uppercase tracking-wider rounded border transition-all", workType === 'creative' ? "bg-black text-white" : "text-app-muted border-app-border")}
+            >🎨 Creativa</button>
+            <button 
+              type="button" onClick={() => setWorkType('mechanical')}
+              className={cn("flex-1 py-2 text-[10px] font-bold uppercase tracking-wider rounded border transition-all", workType === 'mechanical' ? "bg-black text-white" : "text-app-muted border-app-border")}
+            >⚙️ Mecánica</button>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-10">
+        <div className="space-y-3">
+          <label className="text-[10px] font-bold uppercase tracking-[2px] text-app-muted">Recordatorio</label>
+          <select 
+            value={reminderMinutes}
+            onChange={(e) => setReminderMinutes(Number(e.target.value))}
+            className="w-full bg-transparent border-b border-app-border py-2 focus:outline-none focus:border-black text-sm appearance-none"
+          >
+            <option value={15}>15 minutos antes</option>
+            <option value={60}>1 hora antes</option>
+            <option value={180}>3 horas antes</option>
+            <option value={1440}>1 día antes</option>
+          </select>
+        </div>
+        <div className="space-y-3">
+          <label className="text-[10px] font-bold uppercase tracking-[2px] text-app-muted">Nivel de Esfuerzo</label>
           <div className="flex gap-2">
             {(['low', 'medium', 'high'] as const).map((level) => (
               <button
@@ -454,12 +719,10 @@ function AddTaskForm({ onSubmit, onCancel }: { onSubmit: (data: any) => void; on
           </div>
         </div>
       </div>
-
-      <div className="grid grid-cols-2 gap-10">
+        <div className="grid grid-cols-2 gap-10">
         <div className="space-y-3">
           <label className="text-[10px] font-bold uppercase tracking-[2px] text-app-muted flex justify-between">
-            <span>Urgencia (1-5)</span>
-            <span className="text-black">{urgency}</span>
+            <span>Urgencia ({urgency})</span>
           </label>
           <input 
             type="range" min="1" max="5" 
@@ -470,8 +733,7 @@ function AddTaskForm({ onSubmit, onCancel }: { onSubmit: (data: any) => void; on
         </div>
         <div className="space-y-3">
           <label className="text-[10px] font-bold uppercase tracking-[2px] text-app-muted flex justify-between">
-            <span>Importancia (1-5)</span>
-            <span className="text-black">{importance}</span>
+            <span>Importancia ({importance})</span>
           </label>
           <input 
             type="range" min="1" max="5" 
